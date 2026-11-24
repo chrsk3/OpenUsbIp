@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/usbdevice_fs.h>
@@ -34,6 +35,7 @@ static int recv_all(int sock, void *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
         ssize_t r = recv(sock, p + got, len - got, 0);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         got += (size_t)r;
     }
@@ -45,6 +47,7 @@ static int send_all(int sock, const void *buf, size_t len) {
     size_t sent = 0;
     while (sent < len) {
         ssize_t r = send(sock, p + sent, len - sent, 0);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         sent += (size_t)r;
     }
@@ -123,14 +126,17 @@ static void fill_device_info(usbip_usb_device *dev, uint16_t vid, uint16_t pid,
 }
 
 static void handle_urb_loop(int client, int usb_fd) {
-    LOGI("Entrando no loop de URBs (usb_fd=%d)", usb_fd);
+    int flag = 1;
+    setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    LOGI("Loop de URBs iniciado (usb_fd=%d)", usb_fd);
+
     while (g_running) {
         usbip_header_basic hdr;
         if (recv_all(client, &hdr, sizeof(hdr)) < 0) break;
 
         uint32_t cmd = ntohl(hdr.command);
         uint32_t seqnum = ntohl(hdr.seqnum);
-        uint32_t direction = ntohl(hdr.direction); // 1 = IN, 0 = OUT
+        uint32_t direction = ntohl(hdr.direction);
         uint32_t ep = ntohl(hdr.ep);
 
         if (cmd == USBIP_CMD_SUBMIT) {
@@ -138,11 +144,17 @@ static void handle_urb_loop(int client, int usb_fd) {
             if (recv_all(client, &sub, sizeof(sub)) < 0) break;
 
             int32_t len = (int32_t)ntohl((uint32_t)sub.transfer_buffer_length);
+            int is_in = (ep == 0) ? ((sub.setup[0] & 0x80) != 0) : (direction == 1);
+
+            uint16_t wLength = (uint16_t)(sub.setup[6] | (sub.setup[7] << 8));
+            size_t alloc_len = (len > 0) ? (size_t)len : 0;
+            if (ep == 0 && wLength > alloc_len) alloc_len = wLength;
+
             uint8_t *data = NULL;
-            if (len > 0) {
-                data = (uint8_t *)calloc(1, (size_t)len);
+            if (alloc_len > 0) {
+                data = (uint8_t *)calloc(1, alloc_len);
                 if (!data) break;
-                if (direction == 0) { // OUT: recebe payload do cliente
+                if (!is_in && len > 0) {
                     if (recv_all(client, data, (size_t)len) < 0) {
                         free(data);
                         break;
@@ -155,28 +167,38 @@ static void handle_urb_loop(int client, int usb_fd) {
             int actual = 0;
 
             if (ep == 0) {
-                struct usbdevfs_ctrltransfer ctrl;
-                memset(&ctrl, 0, sizeof(ctrl));
-                ctrl.bRequestType = sub.setup[0];
-                ctrl.bRequest = sub.setup[1];
-                ctrl.wValue = (uint16_t)(sub.setup[2] | (sub.setup[3] << 8));
-                ctrl.wIndex = (uint16_t)(sub.setup[4] | (sub.setup[5] << 8));
-                ctrl.wLength = (uint16_t)(sub.setup[6] | (sub.setup[7] << 8));
-                ctrl.timeout = 5000;
-                ctrl.data = data;
+                uint8_t reqType = sub.setup[0];
+                uint8_t req = sub.setup[1];
 
-                ret = ioctl(usb_fd, USBDEVFS_CONTROL, &ctrl);
-                if (ret < 0) {
-                    status = -errno;
+                // Evita -EBUSY no Android quando Windows envia SET_CONFIGURATION ou SET_INTERFACE
+                if ((reqType == 0x00 && req == 0x09) || (reqType == 0x01 && req == 0x0B)) {
+                    status = 0;
                     actual = 0;
                 } else {
-                    status = 0;
-                    actual = ret;
+                    struct usbdevfs_ctrltransfer ctrl;
+                    memset(&ctrl, 0, sizeof(ctrl));
+                    ctrl.bRequestType = reqType;
+                    ctrl.bRequest = req;
+                    ctrl.wValue = (uint16_t)(sub.setup[2] | (sub.setup[3] << 8));
+                    ctrl.wIndex = (uint16_t)(sub.setup[4] | (sub.setup[5] << 8));
+                    ctrl.wLength = wLength;
+                    ctrl.timeout = 5000;
+                    ctrl.data = data;
+
+                    ret = ioctl(usb_fd, USBDEVFS_CONTROL, &ctrl);
+                    if (ret < 0) {
+                        LOGE("CTRL err=%d reqType=0x%02x req=0x%02x wVal=0x%04x", errno, reqType, req, ctrl.wValue);
+                        status = -errno;
+                        actual = 0;
+                    } else {
+                        status = 0;
+                        actual = (len > 0 && ret > len) ? len : ret;
+                    }
                 }
             } else {
                 struct usbdevfs_bulktransfer bulk;
                 memset(&bulk, 0, sizeof(bulk));
-                bulk.ep = ep | (direction ? 0x80 : 0x00);
+                bulk.ep = ep | (is_in ? 0x80 : 0x00);
                 bulk.len = (unsigned int)len;
                 bulk.timeout = 5000;
                 bulk.data = data;
@@ -203,7 +225,7 @@ static void handle_urb_loop(int client, int usb_fd) {
 
             int err = send_all(client, &rhdr, sizeof(rhdr)) < 0 ||
                       send_all(client, &rsub, sizeof(rsub)) < 0;
-            if (!err && direction == 1 && actual > 0 && data) {
+            if (!err && is_in && actual > 0 && data) {
                 err = send_all(client, data, (size_t)actual) < 0;
             }
             free(data);
@@ -223,7 +245,6 @@ static void handle_urb_loop(int client, int usb_fd) {
             if (send_all(client, &rhdr, sizeof(rhdr)) < 0 ||
                 send_all(client, rbody, sizeof(rbody)) < 0) break;
         } else {
-            LOGE("Comando URB desconhecido: 0x%x", cmd);
             break;
         }
     }
@@ -247,9 +268,7 @@ Java_com_openusbip_MainActivity_startUsbIpServer(
         jintArray intfTriples) {
 
     g_server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_server_sock < 0) {
-        return (*env)->NewStringUTF(env, "Erro ao criar socket TCP");
-    }
+    if (g_server_sock < 0) return (*env)->NewStringUTF(env, "Erro ao criar socket TCP");
 
     int opt = 1;
     setsockopt(g_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -277,11 +296,13 @@ Java_com_openusbip_MainActivity_startUsbIpServer(
     jint *elems = (*env)->GetIntArrayElements(env, intfTriples, NULL);
 
     g_running = 1;
-    LOGI("Servidor USB/IP escutando em 127.0.0.1:%d (VID=%04x PID=%04x)", port, vid, pid);
 
     while (g_running) {
         int client = accept(g_server_sock, NULL, NULL);
         if (client < 0) break;
+
+        int flag = 1;
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
 
         uint16_t ver_net, op_net;
         uint32_t status_net;
@@ -298,7 +319,6 @@ Java_com_openusbip_MainActivity_startUsbIpServer(
                          (uint8_t)cls, (uint8_t)sub, (uint8_t)proto, (uint8_t)num_intfs);
 
         if (op == OP_REQ_DEVLIST) {
-            LOGI("Cliente pediu OP_REQ_DEVLIST");
             uint16_t r_ver = htons(USBIP_VERSION);
             uint16_t r_op = htons(OP_REP_DEVLIST);
             uint32_t r_status = htonl(0);
@@ -326,7 +346,6 @@ Java_com_openusbip_MainActivity_startUsbIpServer(
                 close(client);
                 continue;
             }
-            LOGI("Cliente pediu OP_REQ_IMPORT para busid=%s", busid);
             uint16_t r_ver = htons(USBIP_VERSION);
             uint16_t r_op = htons(OP_REP_IMPORT);
             uint32_t r_status = htonl(0);
