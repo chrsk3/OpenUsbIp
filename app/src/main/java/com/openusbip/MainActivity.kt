@@ -10,6 +10,8 @@ import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -33,21 +35,43 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusTv: TextView
     private var activeConnection: UsbDeviceConnection? = null
     private var serverThread: Thread? = null
+    private var autoReconnect = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private fun extractDevice(intent: Intent): UsbDevice? {
+        return if (Build.VERSION.SDK_INT >= 33) {
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+        }
+    }
 
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == ACTION_USB_PERMISSION) {
-                val device: UsbDevice? = if (Build.VERSION.SDK_INT >= 33) {
-                    intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+            when (intent.action) {
+                ACTION_USB_PERMISSION -> {
+                    val device = extractDevice(intent)
+                    val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+                    if (granted && device != null) {
+                        launchServer(device)
+                    } else {
+                        statusTv.text = "Permissão USB negada."
+                    }
                 }
-                val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                if (granted && device != null) {
-                    launchServer(device)
-                } else {
-                    statusTv.text = "Permissão USB negada."
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    stopServerInternal()
+                    if (autoReconnect) {
+                        statusTv.text = "USB desconectado (reboot). Aguardando aparelho voltar..."
+                    } else {
+                        statusTv.text = "Dispositivo USB desconectado."
+                    }
+                }
+                UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+                    if (autoReconnect) {
+                        statusTv.text = "USB detectado! Reconectando servidor..."
+                        mainHandler.postDelayed({ requestAndStart() }, 600)
+                    }
                 }
             }
         }
@@ -68,13 +92,20 @@ class MainActivity : AppCompatActivity() {
         }
 
         val btnStart = Button(this).apply {
-            text = "Iniciar Servidor USB/IP (porta 3240)"
-            setOnClickListener { requestAndStart() }
+            text = "Iniciar Servidor USB/IP (Auto-Reconexão)"
+            setOnClickListener {
+                autoReconnect = true
+                requestAndStart()
+            }
         }
 
         val btnStop = Button(this).apply {
             text = "Parar Servidor"
-            setOnClickListener { stopServer() }
+            setOnClickListener {
+                autoReconnect = false
+                stopServerInternal()
+                statusTv.text = "Servidor parado manualmente."
+            }
         }
 
         layout.addView(btnStart)
@@ -82,9 +113,13 @@ class MainActivity : AppCompatActivity() {
         layout.addView(statusTv)
         setContentView(layout)
 
-        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        val filter = IntentFilter().apply {
+            addAction(ACTION_USB_PERMISSION)
+            addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED)
+            addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        }
         if (Build.VERSION.SDK_INT >= 33) {
-            registerReceiver(usbReceiver, filter, RECEIVER_NOT_EXPORTED)
+            registerReceiver(usbReceiver, filter, RECEIVER_EXPORTED)
         } else {
             registerReceiver(usbReceiver, filter)
         }
@@ -93,21 +128,26 @@ class MainActivity : AppCompatActivity() {
     private fun requestAndStart() {
         val device = usbManager.deviceList.values.firstOrNull()
         if (device == null) {
-            statusTv.text = "Nenhum dispositivo USB detectado no OTG."
+            statusTv.text = if (autoReconnect) {
+                "Aguardando dispositivo USB no OTG..."
+            } else {
+                "Nenhum dispositivo USB detectado no OTG."
+            }
             return
         }
         if (usbManager.hasPermission(device)) {
             launchServer(device)
         } else {
             val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
-            val pi = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), flags)
+            val permIntent = Intent(ACTION_USB_PERMISSION).setPackage(packageName)
+            val pi = PendingIntent.getBroadcast(this, 0, permIntent, flags)
             usbManager.requestPermission(device, pi)
             statusTv.text = "Aguardando autorização USB..."
         }
     }
 
     private fun launchServer(device: UsbDevice) {
-        stopServer()
+        stopServerInternal()
         val conn = usbManager.openDevice(device)
         if (conn == null) {
             statusTv.text = "Falha ao abrir dispositivo USB."
@@ -127,26 +167,33 @@ class MainActivity : AppCompatActivity() {
         val fd = conn.fileDescriptor
         val vidHex = device.vendorId.toString(16).padStart(4, '0')
         val pidHex = device.productId.toString(16).padStart(4, '0')
-        statusTv.text = "Rodando em 127.0.0.1:3240\nDispositivo: ${device.productName ?: "USB"}\nVID:$vidHex PID:$pidHex | FD=$fd | Interfaces=${device.interfaceCount}"
+        statusTv.text = "Rodando em 127.0.0.1:3240 (Auto-Reconexão ATIVA)\nDispositivo: ${device.productName ?: "USB"}\nVID:$vidHex PID:$pidHex | FD=$fd | Interfaces=${device.interfaceCount}"
 
         serverThread = Thread {
             val msg = startUsbIpServer(
                 fd, 3240, device.vendorId, device.productId,
                 device.deviceClass, device.deviceSubclass, device.deviceProtocol, triples
             )
-            runOnUiThread { statusTv.text = "Status: $msg" }
+            runOnUiThread {
+                if (!autoReconnect) {
+                    statusTv.text = "Status: $msg"
+                }
+            }
         }.apply { start() }
     }
 
-    private fun stopServer() {
+    private fun stopServerInternal() {
         stopUsbIpServer()
+        try { serverThread?.join(500) } catch (_: Exception) {}
+        serverThread = null
         activeConnection?.close()
         activeConnection = null
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopServer()
+        autoReconnect = false
+        stopServerInternal()
         unregisterReceiver(usbReceiver)
     }
 }
