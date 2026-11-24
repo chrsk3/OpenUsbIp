@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -46,7 +47,7 @@ static int send_all(int sock, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t sent = 0;
     while (sent < len) {
-        ssize_t r = send(sock, p + sent, len - sent, 0);
+        ssize_t r = send(sock, p + sent, len - sent, MSG_NOSIGNAL);
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) return -1;
         sent += (size_t)r;
@@ -106,6 +107,123 @@ typedef struct {
 } usbip_header_ret_submit;
 #pragma pack(pop)
 
+typedef struct {
+    int client;
+    int usb_fd;
+    volatile int alive;
+    int refcount;
+    pthread_mutex_t lock;
+    pthread_mutex_t send_lock;
+} conn_ctx_t;
+
+typedef struct {
+    conn_ctx_t *ctx;
+    uint32_t seqnum;
+    uint32_t ep;
+    int is_in;
+    int32_t len;
+    uint8_t setup[8];
+    uint8_t *data;
+} urb_job_t;
+
+static void ctx_release(conn_ctx_t *ctx) {
+    pthread_mutex_lock(&ctx->lock);
+    ctx->refcount--;
+    int done = (ctx->refcount == 0);
+    pthread_mutex_unlock(&ctx->lock);
+    if (done) {
+        close(ctx->client);
+        pthread_mutex_destroy(&ctx->lock);
+        pthread_mutex_destroy(&ctx->send_lock);
+        free(ctx);
+    }
+}
+
+static void *urb_worker(void *arg) {
+    urb_job_t *job = (urb_job_t *)arg;
+    conn_ctx_t *ctx = job->ctx;
+
+    int status = 0;
+    int actual = 0;
+    int ret = 0;
+
+    if (job->ep == 0) {
+        uint8_t reqType = job->setup[0];
+        uint8_t req = job->setup[1];
+        uint16_t wLength = (uint16_t)(job->setup[6] | (job->setup[7] << 8));
+
+        if ((reqType == 0x00 && req == 0x09) || (reqType == 0x01 && req == 0x0B)) {
+            status = 0;
+            actual = 0;
+        } else {
+            struct usbdevfs_ctrltransfer ctrl;
+            memset(&ctrl, 0, sizeof(ctrl));
+            ctrl.bRequestType = reqType;
+            ctrl.bRequest = req;
+            ctrl.wValue = (uint16_t)(job->setup[2] | (job->setup[3] << 8));
+            ctrl.wIndex = (uint16_t)(job->setup[4] | (job->setup[5] << 8));
+            ctrl.wLength = wLength;
+            ctrl.timeout = 5000;
+            ctrl.data = job->data;
+
+            ret = ioctl(ctx->usb_fd, USBDEVFS_CONTROL, &ctrl);
+            if (ret < 0) {
+                status = -errno;
+                actual = 0;
+            } else {
+                status = 0;
+                actual = (job->len > 0 && ret > job->len) ? job->len : ret;
+            }
+        }
+    } else {
+        struct usbdevfs_bulktransfer bulk;
+        memset(&bulk, 0, sizeof(bulk));
+        bulk.ep = job->ep | (job->is_in ? 0x80 : 0x00);
+        bulk.len = (unsigned int)job->len;
+        bulk.timeout = 5000;
+        bulk.data = job->data;
+
+        ret = ioctl(ctx->usb_fd, USBDEVFS_BULK, &bulk);
+        if (ret < 0) {
+            status = -errno;
+            actual = 0;
+        } else {
+            status = 0;
+            actual = ret;
+        }
+    }
+
+    if (ctx->alive && g_running) {
+        usbip_header_basic rhdr;
+        memset(&rhdr, 0, sizeof(rhdr));
+        rhdr.command = htonl(USBIP_RET_SUBMIT);
+        rhdr.seqnum = htonl(job->seqnum);
+
+        usbip_header_ret_submit rsub;
+        memset(&rsub, 0, sizeof(rsub));
+        rsub.status = htonl((uint32_t)status);
+        rsub.actual_length = htonl((uint32_t)actual);
+
+        pthread_mutex_lock(&ctx->send_lock);
+        int err = send_all(ctx->client, &rhdr, sizeof(rhdr)) < 0 ||
+                  send_all(ctx->client, &rsub, sizeof(rsub)) < 0;
+        if (!err && job->is_in && actual > 0 && job->data) {
+            err = send_all(ctx->client, job->data, (size_t)actual) < 0;
+        }
+        pthread_mutex_unlock(&ctx->send_lock);
+
+        if (err) {
+            ctx->alive = 0;
+            shutdown(ctx->client, SHUT_RDWR);
+        }
+    }
+
+    free(job->data);
+    free(job);
+    ctx_release(ctx);
+    return NULL;
+}
+
 static void fill_device_info(usbip_usb_device *dev, uint16_t vid, uint16_t pid,
                              uint8_t cls, uint8_t sub, uint8_t proto, uint8_t num_intfs) {
     memset(dev, 0, sizeof(*dev));
@@ -113,7 +231,7 @@ static void fill_device_info(usbip_usb_device *dev, uint16_t vid, uint16_t pid,
     strncpy(dev->busid, "1-1", sizeof(dev->busid) - 1);
     dev->busnum = htonl(1);
     dev->devnum = htonl(2);
-    dev->speed = htonl(3); // USB_SPEED_HIGH
+    dev->speed = htonl(3);
     dev->idVendor = htons(vid);
     dev->idProduct = htons(pid);
     dev->bcdDevice = htons(0x0100);
@@ -128,9 +246,22 @@ static void fill_device_info(usbip_usb_device *dev, uint16_t vid, uint16_t pid,
 static void handle_urb_loop(int client, int usb_fd) {
     int flag = 1;
     setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-    LOGI("Loop de URBs iniciado (usb_fd=%d)", usb_fd);
 
-    while (g_running) {
+    conn_ctx_t *ctx = (conn_ctx_t *)calloc(1, sizeof(conn_ctx_t));
+    if (!ctx) {
+        close(client);
+        return;
+    }
+    ctx->client = client;
+    ctx->usb_fd = usb_fd;
+    ctx->alive = 1;
+    ctx->refcount = 1;
+    pthread_mutex_init(&ctx->lock, NULL);
+    pthread_mutex_init(&ctx->send_lock, NULL);
+
+    LOGI("Loop assincrono de URBs iniciado (usb_fd=%d)", usb_fd);
+
+    while (g_running && ctx->alive) {
         usbip_header_basic hdr;
         if (recv_all(client, &hdr, sizeof(hdr)) < 0) break;
 
@@ -162,75 +293,32 @@ static void handle_urb_loop(int client, int usb_fd) {
                 }
             }
 
-            int ret = 0;
-            int status = 0;
-            int actual = 0;
+            urb_job_t *job = (urb_job_t *)calloc(1, sizeof(urb_job_t));
+            if (!job) {
+                free(data);
+                break;
+            }
+            job->ctx = ctx;
+            job->seqnum = seqnum;
+            job->ep = ep;
+            job->is_in = is_in;
+            job->len = len;
+            memcpy(job->setup, sub.setup, 8);
+            job->data = data;
 
-            if (ep == 0) {
-                uint8_t reqType = sub.setup[0];
-                uint8_t req = sub.setup[1];
+            pthread_mutex_lock(&ctx->lock);
+            ctx->refcount++;
+            pthread_mutex_unlock(&ctx->lock);
 
-                // Evita -EBUSY no Android quando Windows envia SET_CONFIGURATION ou SET_INTERFACE
-                if ((reqType == 0x00 && req == 0x09) || (reqType == 0x01 && req == 0x0B)) {
-                    status = 0;
-                    actual = 0;
-                } else {
-                    struct usbdevfs_ctrltransfer ctrl;
-                    memset(&ctrl, 0, sizeof(ctrl));
-                    ctrl.bRequestType = reqType;
-                    ctrl.bRequest = req;
-                    ctrl.wValue = (uint16_t)(sub.setup[2] | (sub.setup[3] << 8));
-                    ctrl.wIndex = (uint16_t)(sub.setup[4] | (sub.setup[5] << 8));
-                    ctrl.wLength = wLength;
-                    ctrl.timeout = 5000;
-                    ctrl.data = data;
-
-                    ret = ioctl(usb_fd, USBDEVFS_CONTROL, &ctrl);
-                    if (ret < 0) {
-                        LOGE("CTRL err=%d reqType=0x%02x req=0x%02x wVal=0x%04x", errno, reqType, req, ctrl.wValue);
-                        status = -errno;
-                        actual = 0;
-                    } else {
-                        status = 0;
-                        actual = (len > 0 && ret > len) ? len : ret;
-                    }
-                }
+            pthread_t th;
+            if (pthread_create(&th, NULL, urb_worker, job) == 0) {
+                pthread_detach(th);
             } else {
-                struct usbdevfs_bulktransfer bulk;
-                memset(&bulk, 0, sizeof(bulk));
-                bulk.ep = ep | (is_in ? 0x80 : 0x00);
-                bulk.len = (unsigned int)len;
-                bulk.timeout = 5000;
-                bulk.data = data;
-
-                ret = ioctl(usb_fd, USBDEVFS_BULK, &bulk);
-                if (ret < 0) {
-                    status = -errno;
-                    actual = 0;
-                } else {
-                    status = 0;
-                    actual = ret;
-                }
+                free(data);
+                free(job);
+                ctx_release(ctx);
+                break;
             }
-
-            usbip_header_basic rhdr;
-            memset(&rhdr, 0, sizeof(rhdr));
-            rhdr.command = htonl(USBIP_RET_SUBMIT);
-            rhdr.seqnum = htonl(seqnum);
-
-            usbip_header_ret_submit rsub;
-            memset(&rsub, 0, sizeof(rsub));
-            rsub.status = htonl((uint32_t)status);
-            rsub.actual_length = htonl((uint32_t)actual);
-
-            int err = send_all(client, &rhdr, sizeof(rhdr)) < 0 ||
-                      send_all(client, &rsub, sizeof(rsub)) < 0;
-            if (!err && is_in && actual > 0 && data) {
-                err = send_all(client, data, (size_t)actual) < 0;
-            }
-            free(data);
-            if (err) break;
-
         } else if (cmd == USBIP_CMD_UNLINK) {
             uint8_t unlink_body[28];
             if (recv_all(client, unlink_body, sizeof(unlink_body)) < 0) break;
@@ -242,13 +330,21 @@ static void handle_urb_loop(int client, int usb_fd) {
 
             uint8_t rbody[28];
             memset(rbody, 0, sizeof(rbody));
-            if (send_all(client, &rhdr, sizeof(rhdr)) < 0 ||
-                send_all(client, rbody, sizeof(rbody)) < 0) break;
+
+            pthread_mutex_lock(&ctx->send_lock);
+            int err = send_all(client, &rhdr, sizeof(rhdr)) < 0 ||
+                      send_all(client, rbody, sizeof(rbody)) < 0;
+            pthread_mutex_unlock(&ctx->send_lock);
+            if (err) break;
         } else {
             break;
         }
     }
-    LOGI("Loop de URBs encerrado");
+
+    ctx->alive = 0;
+    shutdown(client, SHUT_RDWR);
+    ctx_release(ctx);
+    LOGI("Loop assincrono de URBs encerrado");
 }
 
 JNIEXPORT void JNICALL
@@ -356,7 +452,6 @@ Java_com_openusbip_MainActivity_startUsbIpServer(
             send_all(client, &dev, sizeof(dev));
 
             handle_urb_loop(client, usb_fd);
-            close(client);
         } else {
             close(client);
         }
