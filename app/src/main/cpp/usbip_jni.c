@@ -180,10 +180,10 @@ static void *urb_worker(void *arg) {
         memset(&bulk, 0, sizeof(bulk));
         bulk.ep = job->ep | (job->is_in ? 0x80 : 0x00);
         bulk.len = (unsigned int)job->len;
-        bulk.timeout = 5000;
+        bulk.timeout = 1000;
         bulk.data = job->data;
 
-        ret = ioctl(ctx->usb_fd, USBDEVFS_BULK, &bulk);
+        do { ret = ioctl(ctx->usb_fd, USBDEVFS_BULK, &bulk); } while (ret < 0 && errno == ETIMEDOUT && job->is_in && ctx->alive && g_running);
         if (ret < 0) {
             status = -errno;
             actual = 0;
